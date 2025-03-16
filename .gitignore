@@ -1,0 +1,24 @@
+# Environment and secrets
+.env
+
+# Go build and test files
+*.exe
+mbsgen
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# Project specific
+testing.md
+qdrant_data/
+
+# IDE
+.idea/
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db 

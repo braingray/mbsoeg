@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  mbsoeg:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - QDRANT_HOST=qdrant
+      - SERVER_PORT=${SERVER_PORT}
+      - SERVER_API_KEY=${SERVER_API_KEY}
+      - NUM_WORKERS=${NUM_WORKERS:-1}  # Default to 1 worker if not set
+    ports:
+      - "${SERVER_PORT}:${SERVER_PORT}"
+    depends_on:
+      - qdrant
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+volumes:
+  qdrant_storage:
+    driver: local 
