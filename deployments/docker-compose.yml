@@ -7,7 +7,8 @@ services:
       dockerfile: deployments/Dockerfile
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - QDRANT_HOST=qdrant
+      - QDRANT_HOST=${QDRANT_HOST}
+      - QDRANT_PORT=${QDRANT_PORT}
       - SERVER_PORT=${SERVER_PORT}
       - SERVER_API_KEY=${SERVER_API_KEY}
       - NUM_WORKERS=${NUM_WORKERS:-1}  # Default to 1 worker if not set

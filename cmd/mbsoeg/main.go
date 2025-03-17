@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -47,6 +48,9 @@ func main() {
 }
 
 func runServer() {
+	// Store server start time
+	serverStartTime := time.Now()
+
 	cfg := models.Config{
 		QdrantHost:   os.Getenv("QDRANT_HOST"),
 		QdrantPort:   6334,
@@ -54,6 +58,23 @@ func runServer() {
 		APIKey:       os.Getenv("OPENAI_API_KEY"),
 		ServerPort:   8080,
 		ServerAPIKey: os.Getenv("SERVER_API_KEY"),
+	}
+
+	// Override defaults with environment variables if set
+	if port := os.Getenv("QDRANT_PORT"); port != "" {
+		if p, err := strconv.Atoi(port); err == nil {
+			cfg.QdrantPort = p
+		}
+	}
+	if workers := os.Getenv("NUM_WORKERS"); workers != "" {
+		if w, err := strconv.Atoi(workers); err == nil {
+			cfg.NumWorkers = w
+		}
+	}
+	if port := os.Getenv("SERVER_PORT"); port != "" {
+		if p, err := strconv.Atoi(port); err == nil {
+			cfg.ServerPort = p
+		}
 	}
 
 	log.Printf("Starting server with config: QdrantHost=%s, QdrantPort=%d, NumWorkers=%d, ServerPort=%d",
@@ -82,245 +103,304 @@ func runServer() {
 	}
 	log.Printf("Qdrant collection initialized successfully")
 
-	http.HandleFunc("/process", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Received request from %s", r.RemoteAddr)
+	// Track last request time and processing status
+	var lastRequestTime *time.Time
+	var isProcessing bool
+	var processingMu sync.Mutex
 
-		// Check API key
-		apiKey := r.Header.Get("X-API-Key")
-		if apiKey != cfg.ServerAPIKey {
-			log.Printf("Invalid API key received from %s", r.RemoteAddr)
-			http.Error(w, "Invalid API key", http.StatusUnauthorized)
-			return
-		}
-		log.Printf("API key validated successfully")
+	// Create a new HTTP server
+	server := &http.Server{
+		Addr: fmt.Sprintf(":%d", cfg.ServerPort),
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Add CORS headers
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
-		// Parse request body
-		log.Printf("Parsing request body...")
-		var requestBody struct {
-			MBSItems []models.MBSItem `json:"MBS_Items"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
-			log.Printf("Error parsing request body: %v", err)
-			http.Error(w, fmt.Sprintf("Error parsing request body: %v", err), http.StatusBadRequest)
-			return
-		}
-		log.Printf("Request body parsed successfully")
+			// Handle preflight requests
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 
-		items := requestBody.MBSItems
-		if len(items) == 0 {
-			log.Printf("No MBS items found in request")
-			http.Error(w, "No MBS items found in request", http.StatusBadRequest)
-			return
-		}
-		log.Printf("Found %d MBS items in request", len(items))
+			// Handle health check endpoint
+			if r.Method == "GET" && r.URL.Path == "/" {
+				processingMu.Lock()
+				status := struct {
+					Status       string    `json:"status"`
+					StartTime    time.Time `json:"start_time"`
+					Uptime       string    `json:"uptime"`
+					LastRequest  time.Time `json:"last_request,omitempty"`
+					IsProcessing bool      `json:"is_processing"`
+					Config       struct {
+						QdrantHost string `json:"qdrant_host"`
+						QdrantPort int    `json:"qdrant_port"`
+						NumWorkers int    `json:"num_workers"`
+						ServerPort int    `json:"server_port"`
+					} `json:"config"`
+				}{
+					Status:       "up",
+					StartTime:    serverStartTime,
+					Uptime:       time.Since(serverStartTime).String(),
+					IsProcessing: isProcessing,
+					Config: struct {
+						QdrantHost string `json:"qdrant_host"`
+						QdrantPort int    `json:"qdrant_port"`
+						NumWorkers int    `json:"num_workers"`
+						ServerPort int    `json:"server_port"`
+					}{
+						QdrantHost: cfg.QdrantHost,
+						QdrantPort: cfg.QdrantPort,
+						NumWorkers: cfg.NumWorkers,
+						ServerPort: cfg.ServerPort,
+					},
+				}
+				processingMu.Unlock()
 
-		// Process items
-		currentItems := make(map[string]bool)
-		var skippedCount, updatedCount int
-		var mu sync.Mutex
+				// If there's an active request, include its timestamp
+				if lastRequestTime != nil {
+					status.LastRequest = *lastRequestTime
+				}
 
-		// Create channels for the worker pool
-		jobs := make(chan models.EmbeddingJob, len(items))
-		results := make(chan models.EmbeddingResult, len(items))
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(status)
+				return
+			}
 
-		// Start workers
-		log.Printf("Starting %d workers...", cfg.NumWorkers)
-		var wg sync.WaitGroup
-		for i := 1; i <= cfg.NumWorkers; i++ {
-			wg.Add(1)
-			go func(workerID int) {
-				defer wg.Done()
-				log.Printf("Worker %d started", workerID)
-				for job := range jobs {
-					log.Printf("Worker %d processing item %s", workerID, job.ItemNum)
-					vector, err := embeddingsSvc.GetEmbedding(fmt.Sprintf("MBS Item %s: %s", job.ItemNum, job.Item.Description))
+			// Handle /process endpoint
+			if r.Method == "POST" && r.URL.Path == "/process" {
+				// Update processing status
+				processingMu.Lock()
+				isProcessing = true
+				processingMu.Unlock()
+				defer func() {
+					processingMu.Lock()
+					isProcessing = false
+					processingMu.Unlock()
+				}()
+
+				// Update last request time
+				now := time.Now()
+				lastRequestTime = &now
+
+				// Validate API key
+				apiKey := r.Header.Get("X-API-Key")
+				if apiKey != cfg.ServerAPIKey {
+					log.Printf("Invalid API key received: %s", apiKey)
+					http.Error(w, "Invalid API key", http.StatusUnauthorized)
+					return
+				}
+				log.Printf("API key validated successfully")
+
+				// Parse request body
+				log.Printf("Starting to parse request body...")
+				var request struct {
+					MBS_Items []models.MBSItem `json:"MBS_Items"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					log.Printf("Error parsing request body: %v", err)
+					http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+					return
+				}
+				log.Printf("Successfully parsed request body with %d items", len(request.MBS_Items))
+
+				// Process items
+				var skippedCount, updatedCount int
+				var mu sync.Mutex
+				currentItems := make(map[string]bool)
+
+				// Get existing points from Qdrant
+				log.Printf("Getting existing points from Qdrant...")
+				existingPoints, err := storageSvc.ScrollPoints(ctx, "descriptions")
+				if err != nil {
+					log.Printf("Failed to get existing points: %v", err)
+					http.Error(w, fmt.Sprintf("Failed to get existing points: %v", err), http.StatusInternalServerError)
+					return
+				}
+				log.Printf("Got %d existing points from Qdrant", len(existingPoints))
+
+				// Create worker pool
+				jobs := make(chan models.EmbeddingJob, len(request.MBS_Items))
+				resultsChan := make(chan models.EmbeddingResult, len(request.MBS_Items))
+
+				// Start workers
+				var wg sync.WaitGroup
+				for w := 1; w <= cfg.NumWorkers; w++ {
+					wg.Add(1)
+					go func(workerID int) {
+						defer wg.Done()
+						for job := range jobs {
+							log.Printf("Worker %d processing item %s", workerID, job.ItemNum)
+							vector, err := embeddingsSvc.GetEmbedding(fmt.Sprintf("MBS Item %s: %s", job.ItemNum, job.Item.Description))
+							resultsChan <- models.EmbeddingResult{
+								ItemNum: job.ItemNum,
+								Vector:  vector,
+								Item:    job.Item,
+								NewHash: job.NewHash,
+								Error:   err,
+							}
+						}
+					}(w)
+				}
+
+				// Queue jobs for items that need processing
+				jobCount := 0
+				for i, item := range request.MBS_Items {
+					log.Printf("Checking item %d/%d: %s", i+1, len(request.MBS_Items), item.ItemNum)
+					currentItems[item.ItemNum] = true
+
+					// Check if item needs updating
+					descHash := storageSvc.GenerateHash(item)
+					point, err := storageSvc.GetPoint(ctx, item.ItemNum, "descriptions")
 					if err != nil {
-						log.Printf("Worker %d error getting embedding for item %s: %v", workerID, job.ItemNum, err)
+						log.Printf("Error getting point for item %s: %v", item.ItemNum, err)
+						continue
+					}
+
+					if point != nil {
+						payload := point.Payload
+						if hashValue, ok := payload["_hash"]; ok {
+							if hash, ok := hashValue.GetKind().(*qdrant.Value_StringValue); ok {
+								if hash.StringValue == descHash {
+									log.Printf("Skipping unchanged item %s (hash: %s)", item.ItemNum, descHash)
+									mu.Lock()
+									skippedCount++
+									mu.Unlock()
+									continue
+								}
+								log.Printf("Item %s has changed (old hash: %s, new hash: %s)", item.ItemNum, hash.StringValue, descHash)
+							}
+						}
 					} else {
-						log.Printf("Worker %d got embedding for item %s", workerID, job.ItemNum)
+						log.Printf("Item %s is new (hash: %s)", item.ItemNum, descHash)
 					}
-					results <- models.EmbeddingResult{
-						ItemNum: job.ItemNum,
-						Vector:  vector,
-						Item:    job.Item,
-						NewHash: job.NewHash,
-						Error:   err,
+
+					jobs <- models.EmbeddingJob{
+						ItemNum: item.ItemNum,
+						Text:    fmt.Sprintf("MBS Item %s: %s", item.ItemNum, item.Description),
+						Item:    item,
+						NewHash: descHash,
+					}
+					jobCount++
+				}
+				close(jobs)
+				log.Printf("Queued %d items for processing", jobCount)
+
+				// Process results
+				go func() {
+					for result := range resultsChan {
+						if result.Error != nil {
+							log.Printf("Error processing item %s: %v", result.ItemNum, result.Error)
+							continue
+						}
+
+						// Store in Qdrant
+						log.Printf("Storing item %s in Qdrant...", result.ItemNum)
+						payload := map[string]interface{}{
+							// Metadata fields
+							"_hash":       result.NewHash,
+							"_last_check": time.Now().Format(time.RFC3339),
+
+							// Required fields
+							"item_num":               result.Item.ItemNum,
+							"description":            result.Item.Description,
+							"new_item":               result.Item.NewItem,
+							"item_change":            result.Item.ItemChange,
+							"fee_change":             result.Item.FeeChange,
+							"benefit_change":         result.Item.BenefitChange,
+							"anaes_change":           result.Item.AnaesChange,
+							"emsn_change":            result.Item.EMSNChange,
+							"descriptor_change":      result.Item.DescriptorChange,
+							"anaes":                  result.Item.Anaes,
+							"item_start_date":        result.Item.ItemStartDate,
+							"item_end_date":          result.Item.ItemEndDate,
+							"fee_start_date":         result.Item.FeeStartDate,
+							"benefit_start_date":     result.Item.BenefitStartDate,
+							"description_start_date": result.Item.DescriptionStartDate,
+							"emsn_start_date":        result.Item.EMSNStartDate,
+							"emsn_end_date":          result.Item.EMSNEndDate,
+							"qfe_start_date":         result.Item.QFEStartDate,
+							"qfe_end_date":           result.Item.QFEEndDate,
+							"derived_fee_start_date": result.Item.DerivedFeeStartDate,
+							"emsn_change_date":       result.Item.EMSNChangeDate,
+							"schedule_fee":           result.Item.ScheduleFee,
+							"derived_fee":            result.Item.DerivedFee,
+							"benefit_75":             result.Item.Benefit75,
+							"benefit_85":             result.Item.Benefit85,
+							"benefit_100":            result.Item.Benefit100,
+							"emsn_percentage_cap":    result.Item.EMSNPercentageCap,
+							"emsn_maximum_cap":       result.Item.EMSNMaximumCap,
+							"emsn_fixed_cap_amount":  result.Item.EMSNFixedCapAmount,
+							"emsn_cap":               result.Item.EMSNCap,
+							"basic_units":            result.Item.BasicUnits,
+							"category":               result.Item.Category,
+							"group":                  result.Item.Group,
+							"sub_group":              result.Item.SubGroup,
+							"sub_heading":            result.Item.SubHeading,
+							"item_type":              result.Item.ItemType,
+							"sub_item_num":           result.Item.SubItemNum,
+							"benefit_type":           result.Item.BenefitType,
+							"fee_type":               result.Item.FeeType,
+							"provider_type":          result.Item.ProviderType,
+							"emsn_description":       result.Item.EMSNDescription,
+						}
+						if err := storageSvc.UpsertPoint(ctx, result.ItemNum, result.Vector, payload, "descriptions"); err != nil {
+							log.Printf("Error upserting point for item %s: %v", result.ItemNum, err)
+							continue
+						}
+
+						mu.Lock()
+						updatedCount++
+						mu.Unlock()
+					}
+				}()
+
+				// Wait for all workers to finish
+				wg.Wait()
+				close(resultsChan)
+
+				// Remove items that no longer exist
+				var removedCount int
+				for _, point := range existingPoints {
+					itemNum := fmt.Sprintf("%d", point.Id.GetNum())
+					if !currentItems[itemNum] {
+						if err := storageSvc.DeletePoint(ctx, itemNum, "descriptions"); err != nil {
+							log.Printf("Error deleting point for item %s: %v", itemNum, err)
+							continue
+						}
+						removedCount++
 					}
 				}
-				log.Printf("Worker %d finished", workerID)
-			}(i)
-		}
 
-		// Process existing items
-		log.Printf("Getting existing points from Qdrant...")
-		existingPoints, err := storageSvc.ScrollPoints(ctx, "descriptions")
-		if err != nil {
-			log.Printf("Failed to get existing points: %v", err)
-			http.Error(w, fmt.Sprintf("Failed to get existing points: %v", err), http.StatusInternalServerError)
-			return
-		}
-		log.Printf("Got %d existing points from Qdrant", len(existingPoints))
+				// Print summary
+				log.Printf("Processing complete:")
+				log.Printf("- Items processed: %d", len(request.MBS_Items))
+				log.Printf("- Items skipped (unchanged): %d", skippedCount)
+				log.Printf("- Items updated: %d", updatedCount)
+				log.Printf("- Items removed: %d", removedCount)
 
-		existingItems := make(map[string]bool)
-		for _, point := range existingPoints {
-			itemNum := fmt.Sprintf("%d", point.Id.GetNum())
-			existingItems[itemNum] = true
-		}
-
-		// Queue jobs for items that need processing
-		log.Printf("Queueing jobs for processing...")
-		jobCount := 0
-		for _, item := range items {
-			currentItems[item.ItemNum] = true
-			descHash := storageSvc.GenerateHash(item)
-
-			// Get existing point to check hash
-			log.Printf("Checking existing point for item %s...", item.ItemNum)
-			point, err := storageSvc.GetPoint(ctx, item.ItemNum, "descriptions")
-			if err != nil {
-				log.Printf("Error getting point for item %s: %v", item.ItemNum, err)
-				continue
+				// Return response
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"status":        "success",
+					"total_items":   len(request.MBS_Items),
+					"skipped_items": skippedCount,
+					"updated_items": updatedCount,
+					"removed_items": removedCount,
+				})
+				log.Printf("Request completed successfully")
+				return
 			}
 
-			if point != nil {
-				payload := point.Payload
-				if hash, ok := payload["_hash"].GetKind().(*qdrant.Value_StringValue); ok && hash.StringValue == descHash {
-					mu.Lock()
-					skippedCount++
-					mu.Unlock()
-					log.Printf("Skipping unchanged item %s", item.ItemNum)
-					continue
-				}
-			}
+			// Handle unknown endpoints
+			http.Error(w, "Not found", http.StatusNotFound)
+		}),
+	}
 
-			log.Printf("Queueing item %s for processing", item.ItemNum)
-			jobs <- models.EmbeddingJob{
-				ItemNum: item.ItemNum,
-				Text:    fmt.Sprintf("MBS Item %s: %s", item.ItemNum, item.Description),
-				Item:    item,
-				NewHash: descHash,
-			}
-			jobCount++
-		}
-		log.Printf("Queued %d jobs for processing", jobCount)
-		close(jobs)
-
-		// Process results
-		log.Printf("Processing results...")
-		for i := 0; i < jobCount; i++ {
-			result := <-results
-			if result.Error != nil {
-				log.Printf("Error processing item %s: %v", result.ItemNum, result.Error)
-				continue
-			}
-
-			log.Printf("Upserting point for item %s...", result.ItemNum)
-			// Create a map of individual fields for the payload
-			payload := map[string]interface{}{
-				// Metadata fields
-				"_hash":       result.NewHash,
-				"_last_check": time.Now().Format(time.RFC3339),
-
-				// Required fields
-				"item_num":    result.Item.ItemNum,
-				"description": result.Item.Description,
-
-				// Boolean fields
-				"new_item":          result.Item.NewItem,
-				"item_change":       result.Item.ItemChange,
-				"fee_change":        result.Item.FeeChange,
-				"benefit_change":    result.Item.BenefitChange,
-				"anaes_change":      result.Item.AnaesChange,
-				"emsn_change":       result.Item.EMSNChange,
-				"descriptor_change": result.Item.DescriptorChange,
-				"anaes":             result.Item.Anaes,
-
-				// Date fields
-				"item_start_date":        result.Item.ItemStartDate,
-				"item_end_date":          result.Item.ItemEndDate,
-				"fee_start_date":         result.Item.FeeStartDate,
-				"benefit_start_date":     result.Item.BenefitStartDate,
-				"description_start_date": result.Item.DescriptionStartDate,
-				"emsn_start_date":        result.Item.EMSNStartDate,
-				"emsn_end_date":          result.Item.EMSNEndDate,
-				"qfe_start_date":         result.Item.QFEStartDate,
-				"qfe_end_date":           result.Item.QFEEndDate,
-				"derived_fee_start_date": result.Item.DerivedFeeStartDate,
-				"emsn_change_date":       result.Item.EMSNChangeDate,
-
-				// Float/numeric fields
-				"schedule_fee":          result.Item.ScheduleFee,
-				"derived_fee":           result.Item.DerivedFee,
-				"benefit_75":            result.Item.Benefit75,
-				"benefit_85":            result.Item.Benefit85,
-				"benefit_100":           result.Item.Benefit100,
-				"emsn_percentage_cap":   result.Item.EMSNPercentageCap,
-				"emsn_maximum_cap":      result.Item.EMSNMaximumCap,
-				"emsn_fixed_cap_amount": result.Item.EMSNFixedCapAmount,
-				"emsn_cap":              result.Item.EMSNCap,
-				"basic_units":           result.Item.BasicUnits,
-
-				// String fields
-				"category":         result.Item.Category,
-				"group":            result.Item.Group,
-				"sub_group":        result.Item.SubGroup,
-				"sub_heading":      result.Item.SubHeading,
-				"item_type":        result.Item.ItemType,
-				"sub_item_num":     result.Item.SubItemNum,
-				"benefit_type":     result.Item.BenefitType,
-				"fee_type":         result.Item.FeeType,
-				"provider_type":    result.Item.ProviderType,
-				"emsn_description": result.Item.EMSNDescription,
-			}
-			if err := storageSvc.UpsertPoint(ctx, result.ItemNum, result.Vector, payload, "descriptions"); err != nil {
-				log.Printf("Error upserting point for item %s: %v", result.ItemNum, err)
-				continue
-			}
-			log.Printf("Successfully upserted point for item %s", result.ItemNum)
-
-			mu.Lock()
-			updatedCount++
-			mu.Unlock()
-		}
-
-		// Wait for all workers to finish
-		log.Printf("Waiting for workers to finish...")
-		wg.Wait()
-		close(results)
-		log.Printf("All workers finished")
-
-		// Remove items that no longer exist
-		log.Printf("Removing obsolete items...")
-		var removedCount int
-		for itemNum := range existingItems {
-			if !currentItems[itemNum] {
-				log.Printf("Removing item %s...", itemNum)
-				if err := storageSvc.DeletePoint(ctx, itemNum, "descriptions"); err != nil {
-					log.Printf("Error deleting point for item %s: %v", itemNum, err)
-					continue
-				}
-				log.Printf("Successfully removed item %s", itemNum)
-				removedCount++
-			}
-		}
-
-		// Send response
-		response := map[string]interface{}{
-			"items_processed": len(items),
-			"items_skipped":   skippedCount,
-			"items_updated":   updatedCount,
-			"items_removed":   removedCount,
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		log.Printf("Sending response: %+v", response)
-		json.NewEncoder(w).Encode(response)
-		log.Printf("Request completed successfully")
-	})
-
-	log.Printf("Starting server on port %d", cfg.ServerPort)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", cfg.ServerPort), nil); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	// Start the server
+	log.Printf("Starting server on port %d...", cfg.ServerPort)
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("Server error: %v", err)
 	}
 }
 
@@ -357,6 +437,23 @@ func runCLI(jsonFile string) {
 		ServerAPIKey: os.Getenv("SERVER_API_KEY"),
 	}
 
+	// Override defaults with environment variables if set
+	if port := os.Getenv("QDRANT_PORT"); port != "" {
+		if p, err := strconv.Atoi(port); err == nil {
+			cfg.QdrantPort = p
+		}
+	}
+	if workers := os.Getenv("NUM_WORKERS"); workers != "" {
+		if w, err := strconv.Atoi(workers); err == nil {
+			cfg.NumWorkers = w
+		}
+	}
+	if port := os.Getenv("SERVER_PORT"); port != "" {
+		if p, err := strconv.Atoi(port); err == nil {
+			cfg.ServerPort = p
+		}
+	}
+
 	// Validate OpenAI API key
 	embeddingsSvc := embeddings.NewService(cfg.APIKey)
 	if err := embeddingsSvc.ValidateAPIKey(); err != nil {
@@ -376,9 +473,9 @@ func runCLI(jsonFile string) {
 	}
 
 	// Process items
-	currentItems := make(map[string]bool)
 	var skippedCount, updatedCount int
 	var mu sync.Mutex
+	currentItems := make(map[string]bool)
 
 	// Create channels for the worker pool
 	jobs := make(chan models.EmbeddingJob, len(items))
@@ -433,12 +530,19 @@ func runCLI(jsonFile string) {
 
 		if point != nil {
 			payload := point.Payload
-			if hash, ok := payload["_hash"].GetKind().(*qdrant.Value_StringValue); ok && hash.StringValue == descHash {
-				mu.Lock()
-				skippedCount++
-				mu.Unlock()
-				continue
+			if hashValue, ok := payload["_hash"]; ok {
+				if hash, ok := hashValue.GetKind().(*qdrant.Value_StringValue); ok {
+					if hash.StringValue == descHash {
+						mu.Lock()
+						skippedCount++
+						mu.Unlock()
+						continue
+					}
+					log.Printf("Item %s has changed (old hash: %s, new hash: %s)", item.ItemNum, hash.StringValue, descHash)
+				}
 			}
+		} else {
+			log.Printf("Item %s is new (hash: %s)", item.ItemNum, descHash)
 		}
 
 		jobs <- models.EmbeddingJob{

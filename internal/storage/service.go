@@ -60,13 +60,24 @@ func (s *Service) InitializeCollection(ctx context.Context) error {
 
 // GenerateHash creates a hash of the item's content to detect changes
 func (s *Service) GenerateHash(item models.MBSItem) string {
-	descriptionContent := fmt.Sprintf("%v-%v-%v-%v-%v-%v",
+	descriptionContent := fmt.Sprintf("%v-%v-%v-%v-%v-%v-%v-%v-%v-%v-%v-%v-%v-%v-%v-%v-%v",
+		item.ItemNum,
 		item.Description,
-		item.Benefit100,
+		item.ItemStartDate,
+		item.ItemEndDate,
+		item.FeeStartDate,
+		item.BenefitStartDate,
+		item.DescriptionStartDate,
+		item.EMSNStartDate,
+		item.EMSNEndDate,
+		item.QFEStartDate,
+		item.QFEEndDate,
+		item.DerivedFeeStartDate,
+		item.EMSNChangeDate,
 		item.ScheduleFee,
+		item.Benefit100,
 		item.BenefitType,
 		item.Category,
-		item.ItemType,
 	)
 	descriptionHash := sha256.Sum256([]byte(descriptionContent))
 
